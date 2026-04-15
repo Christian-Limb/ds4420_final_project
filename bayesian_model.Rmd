@@ -3,6 +3,10 @@ title: "Final Project Bayesian Regression Model"
 author: "Yuqi Chen"
 output: html_notebook
 ---
+```{r}
+library(ggplot2)
+library(MASS)
+```
 
 
 ```{r}
@@ -11,17 +15,280 @@ df$Week.ending <- as.Date(df$Week.ending)
 df
 ```
 ```{r}
+sample_mu = mean(df$Total.Lower.48)
+sample_sig = sqrt(var(df$Total.Lower.48))
+
+x = seq(500, 4500, length.out=1000)
+n_prob = dnorm(x, sample_mu, sample_sig)
+```
+
+```{r}
+ggplot(df, aes(x = Total.Lower.48)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30) +
+  geom_line(aes(x = x, y = n_prob), data = data.frame(x, n_prob), color = "red") +
+  geom_vline(aes(xintercept=sample_mu), color='red') +
+  labs(x="storage volume (ft^3)", title="Data Likelihood Overlayed with N(mu, s^2)")
+
+#ggsave("data_likelihood.png")
+```
+
+```{r}
 df_sp <- read.csv("Henry_Hub_Natural_Gas_Spot_Price.csv")
 df_sp$Week.of <- as.Date(df_sp$Week.of, format="%m/%d/%Y")
 df_sp
 ```
-```{r}
-mask <- as.Date("2010-01-01") <= df_sp$Week.of & df_sp$Week.of <= as.Date("2026-02-06")
 
-data <- cbind(
-  df_sp[mask, "Henry.Hub.Natural.Gas.Spot.Price.Dollars.per.Million.Btu", drop = FALSE],
-  df[mask, "Total.Lower.48", drop = FALSE])
-data
+```{r}
+mask_sp <- as.Date("2010-01-01") <= df_sp$Week.of & df_sp$Week.of <= as.Date("2026-02-06")
+mask_df <- as.Date("2010-01-01") <= df$Week.ending & df$Week.ending <= as.Date("2026-02-06")
+```
+
+```{r}
+price <- df_sp[mask_sp, c("Week.of", "Henry.Hub.Natural.Gas.Spot.Price.Dollars.per.Million.Btu")]
+volume <- df[mask_df, c("Week.ending", "Total.Lower.48")]
+
+data <- merge(x=price, y=volume, by.x="Week.of", by.y="Week.ending", all = FALSE)
+
+```
+
+```{r}
+n <- nrow(data)
+
+split <- n - 104
+data_train <- data[1:split, ]
+data_test  <- data[(split + 1):n, ]
 ```
 
 
+```{r}
+gibbs_sampler <- function(n, X_train, Y_train, prior, burn = 0.18) {
+  total_iter <- floor(n / (1 - burn))
+  p <- ncol(X_train)
+  XtX <- t(X_train) %*% X_train
+  Xty <- t(X_train) %*% Y_train
+  Sigma0_inv <- solve(prior$Sigma0)
+  
+  w <- rep(0, p)
+  sigma_y <- 1
+  samples <- matrix(NA, nrow = total_iter, ncol = p + 1)
+  
+  for (i in seq(1:total_iter)) {
+    
+    # Sample M, V
+    V <- solve((1 / sigma_y) * XtX + Sigma0_inv)
+    M <- V %*% ((1 / sigma_y) * Xty + Sigma0_inv %*% prior$w0)
+    w <- mvrnorm(1, M, V)
+    
+    # Sample sigma_y
+    resid  <- Y_train - X_train %*% w
+    A      <- (2 * prior$alpha0 + length(Y_train)) / 2
+    B      <- (2 * prior$beta0  + t(resid) %*% resid) / 2
+    sigma_y <- 1 / rgamma(1, shape = A, rate = B)
+    
+    samples[i, ] <- c(w, sigma_y)
+  }
+  
+  burn_n  <- floor(burn * total_iter)
+  samples <- samples[(burn_n + 1):nrow(samples), ]
+
+  return(samples)
+}
+```
+
+```{r}
+## manual lag data prep
+lag_features <- function(data, max_lag) {
+  price_embed   <- embed(data$Henry.Hub.Natural.Gas.Spot.Price.Dollars.per.Million.Btu, max_lag + 1)
+  storage_embed <- embed(data$Total.Lower.48, max_lag + 1)
+  
+  X_train <- cbind(
+    intercept = 1,
+    price_embed[, 2:(max_lag + 1)],
+    storage_embed[, 2:(max_lag + 1)]
+  )
+  
+  colnames(X_train) <- c("intercept",
+                   paste0("price_lag",   1:max_lag),
+                   paste0("storage_lag", 1:max_lag))
+  
+  Y <- storage_embed[, 1]
+  
+  return(list(X_train = as.matrix(X_train), Y = as.matrix(Y, ncol=1)))
+}
+```
+
+```{r}
+result <- lag_features(data_train, max_lag=4)
+X_train <- result$X_train
+Y_train <- result$Y
+dim(Y_train)
+```
+
+
+```{r}
+p = ncol(X_train)
+Sigma0 = diag(4, p)
+Sigma0[1] = 1000 # uninformative prior for intercept
+prior <- list(
+  w0 = rep(0, p),
+  Sigma0 = Sigma0,
+  alpha0 = 2,
+  beta0 = 1
+)
+cat(dim(X_train))
+cat(dim(Y_train))
+samples <- gibbs_sampler(10000, X_train, Y_train, prior)
+```
+```{r}
+acf(samples[,1])
+```
+```{r}
+hist(samples[,1], main = "Posterior of Intercept")
+```
+
+```{r}
+hist(samples[,1], main = "Posterior of Lag1 Volume")
+```
+```{r}
+samples_w <- samples[,1:9]
+samples_sigma_y <- samples[,10]
+volume_hat <- c()
+for(i in 1:nrow(samples)){
+  volume_hat <- c(volume_hat, rnorm(n = 1, mean = t(samples_w[i,])%*%X_train[1,], sd = sqrt(samples_sigma_y[i])))
+}
+```
+
+
+```{r}
+hist(volume_hat, main="Posterior Predictive Distr. Histogram")
+
+mean(volume_hat)
+sample_mu
+```
+```{r}
+nrow(samples[,1:p])
+```
+
+```{r}
+get_forecast <- function(samples, past_data, n_ahead) {
+  p <- ncol(samples) - 1
+  w_post <- samples[, 1:p]
+
+  price_hist <- tail(past_data$Henry.Hub.Natural.Gas.Spot.Price.Dollars.per.Million.Btu, 4)
+  storage_hist <- tail(past_data$Total.Lower.48, 4)
+
+  forecasts <- numeric(n_ahead)
+  forecasts_above <- numeric(n_ahead)
+  forecasts_below <- numeric(n_ahead)
+
+  for (h in 1:n_ahead) {
+    x_new <- c(1, rev(tail(price_hist, 4)), rev(tail(storage_hist, 4)))
+    
+    mu_hat <- w_post %*% x_new
+    
+    forecasts[h] <- mean(mu_hat)
+    forecasts_above[h] <- as.numeric(quantile(mu_hat, probs=0.95))
+    forecasts_below[h] <- as.numeric(quantile(mu_hat, probs=0.05))
+      
+    storage_hist <- c(storage_hist, mean(mu_hat))
+    price_hist <- c(price_hist, tail(price_hist, 1))
+  }
+
+  return(data.frame(
+  step = 1:n_ahead, 
+  forecast = forecasts,
+  lower_95 = forecasts_below,
+  upper_95 = forecasts_above
+))
+}
+```
+
+
+```{r}
+fc <- get_forecast(samples, data_train, 104)
+```
+
+```{r}
+colnames(fc)
+```
+
+```{r}
+actual <- data_test$Total.Lower.48
+resid <- as.matrix(actual - fc$forecast)
+rmse <- sqrt(mean(resid**2))
+rmse
+```
+
+
+```{r}
+fc_plot <- fc
+fc_plot$actual <- actual
+head(fc_plot)
+```
+
+```{r}
+
+ggplot(fc_plot, aes(x = step)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95), fill = "steelblue", alpha = 0.2) + 
+  geom_line(aes(y = actual), color = "black", linewidth = 1) +
+  geom_line(aes(y = forecast), color = "steelblue", linewidth = 1) +
+  labs (
+    x = "Weeks", 
+    y = "Storage Volume (Bcf)",
+    title = "Forecast vs Actual",
+    subtitle = "RMSE = 597.7243"
+  ) +
+  theme_minimal()
+
+ggsave("bayesian_pred.png")
+```
+```{r}
+walk_forward_cv <- function(data, prior) {
+  n <- nrow(data)
+  cv_start <- n - 52 * 5
+  fold_starts <- floor(seq(cv_start, n - 52 - 4, length.out = 5))
+  fold_results <- list()
+
+  for (f in seq_along(fold_starts)) {
+    train_end <- fold_starts[f]
+    data_tr <- data[1:train_end, ]
+
+    lagged_train <- lag_features(data_tr, max_lag = 4)
+    X_train <- lagged_train$X_train
+    y_train <- lagged_train$Y
+
+    samples <- gibbs_sampler(10000, X_train, y_train, prior)
+
+    fc <- forecast(samples, data_tr, 52)
+    actual <- data$Total.Lower.48[(train_end + 1):(train_end + nrow(fc))]
+
+    rmse <- sqrt(mean((actual - fc$forecast)^2))
+    fold_results[[f]] <- data.frame(fold = f, RMSE = rmse)
+    cat(sprintf("Fold %d RMSE: %.2f\n", f, rmse))
+  }
+
+  results <- do.call(rbind, fold_results)
+  results
+}
+```
+
+```{r}
+walk_forward_cv(data, prior=prior)
+```
+```{r}
+# testing with a more informed prior
+Sigma0 = diag(2, p)
+Sigma0[1] = 1000 # uninformative prior for intercept
+prior2 <- list(
+  w0 = rep(0, p),
+  Sigma0 = Sigma0,
+  alpha0 = 2,
+  beta0 = 1
+)
+```
+
+```{r}
+walk_forward_cv(data, prior2)
+```
+
+Original Model is better
