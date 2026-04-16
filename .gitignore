@@ -1,4 +1,4 @@
-.DS_Store
+DS_Store
 .gitignore
 plots/
 __pycache__/
